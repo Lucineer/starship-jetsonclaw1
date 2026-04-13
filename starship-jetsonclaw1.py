@@ -8,6 +8,7 @@ Walk around, examine systems, interact with the ship.
 
 Rooms:
   Bridge         — Command center, fleet comms, navigation
+  Tactical       — Threat assessment, anomaly detection, combat alerts
   Engine Room    — GPU cores, CUDA kernels, CUDA governor
   Life Support   — Thermal zones, fan control, power modes
   Cargo Bay      — NVME storage, memory allocation
@@ -23,6 +24,12 @@ Controls:
   examine <thing>    — Look at something closely
   status             — Ship-wide status report
   scan               — Deep scan all systems
+  watch              — Auto-refresh telemetry every 2s (Ctrl+C to stop)
+  pulse              — Compact one-line status readout
+  fleet              — Query fleet sensor data (wheelhouse-api)
+  compass            — Check compass hardware
+  gps                — Check GPS hardware
+  depth              — Check depth sounder
   help               — Show commands
   quit               — Disconnect from bridge
 """
@@ -33,6 +40,9 @@ import time
 import json
 import subprocess
 import re
+import threading
+import urllib.request
+import urllib.error
 
 # ═══ Colors ═══
 
@@ -79,6 +89,13 @@ def get_thermal_zones():
                     zones.append((idx, temp_c))
     except: pass
     return zones
+
+def get_gpu_temp():
+    """Get GPU temperature specifically."""
+    for idx, temp in get_thermal_zones():
+        if "gpu" in (read_file(f"/sys/class/thermal/thermal_zone{idx}/type") or "").lower():
+            return temp
+    return None
 
 def get_memory():
     """Parse /proc/meminfo."""
@@ -144,6 +161,14 @@ def get_load():
         return parts[0], parts[1], parts[2]
     except: return "0", "0", "0"
 
+def get_cpu_pct():
+    """Rough CPU usage percentage from load average."""
+    try:
+        with open("/proc/loadavg") as f:
+            load1 = float(f.read().split()[0])
+        return min(int(load1 / 4.0 * 100), 100)  # 4 cores on Orin Nano
+    except: return 0
+
 def get_running_agents():
     """Count agent-like processes."""
     try:
@@ -152,13 +177,35 @@ def get_running_agents():
         return int(r.stdout.strip()) if r.stdout.strip() else 0
     except: return 0
 
+# ═══ Alert Helpers ═══
+
+def alert_color(value, warn_thresh, crit_thresh, above=True):
+    """Return color based on thresholds. above=True means higher is worse."""
+    if above:
+        if value >= crit_thresh: return C.RED
+        if value >= warn_thresh: return C.YEL
+    else:
+        if value <= crit_thresh: return C.RED
+        if value <= warn_thresh: return C.YEL
+    return C.GRN
+
+def format_status_bar():
+    """Compact status bar for watch mode."""
+    gpu_t = get_gpu_temp()
+    mem = get_memory()
+    cpu = get_cpu_pct()
+    gpu_str = f"{gpu_t:.0f}°C" if gpu_t is not None else "N/A"
+    mem_str = f"{mem['available']/1024:.1f}GB" if mem['available'] >= 1024 else f"{mem['available']}MB"
+    return f"GPU:{gpu_str} RAM:{mem_str} CPU:{cpu}%"
+
 # ═══ Room Definitions ═══
 
 class Room:
-    def __init__(self, name, short_desc, examine_fn):
+    def __init__(self, name, short_desc, examine_fn, exits=None):
         self.name = name
         self.short_desc = short_desc
         self.examine_fn = examine_fn
+        self.exits = exits or []
 
 def make_rooms():
     rooms = {}
@@ -189,13 +236,92 @@ def make_rooms():
             f"  Lighthouse:   Oracle1 — cloud-bearing vessel",
             "",
             f"  {b('EXITS:', C.YEL)} engine-room, life-support, cargo-bay, sickbay,",
-            f"           holodeck, science-lab, airlock, quarterdeck",
+            f"           holodeck, science-lab, airlock, quarterdeck, tactical",
         ]
         return "\n".join(lines)
 
     rooms["bridge"] = Room("Bridge",
         "The nerve center of the USS JetsonClaw1. Screens flicker with real-time telemetry.",
         examine_bridge)
+
+    # TACTICAL
+    def examine_tactical():
+        gpu_t = get_gpu_temp()
+        mem = get_memory()
+        cpu = get_cpu_pct()
+        zones = get_thermal_zones()
+
+        lines = [
+            "",
+            f"  {b('╔══════════════════════════════════════════╗', C.RED)}",
+            f"  {b('║     TACTICAL — THREAT ASSESSMENT        ║', C.RED)}",
+            f"  {b('╚══════════════════════════════════════════╝', C.RED)}",
+            "",
+            f"  {b('SHIELDS STATUS', C.WHT)}",
+        ]
+
+        # Anomaly detection
+        anomalies = []
+        if gpu_t is not None:
+            if gpu_t > 70:
+                anomalies.append(f"  {b('⚠️  ENGINE OVERHEAT', C.RED)} — GPU at {gpu_t:.1f}°C (threshold: 70°C)")
+        if mem['available'] < 500:
+            anomalies.append(f"  {b('⚠️  MEMORY CRITICAL', C.RED)} — Only {mem['available']} MB free")
+        elif mem['available'] < 1000:
+            anomalies.append(f"  {b('⚠️  MEMORY WARNING', C.YEL)} — {mem['available']} MB free")
+
+        # Thermal zone alerts
+        for idx, temp in zones:
+            if temp > 80:
+                ztype = read_file(f"/sys/class/thermal/thermal_zone{idx}/type") or f"zone{idx}"
+                anomalies.append(f"  {b('⚠️  THERMAL ALERT', C.RED)} — {ztype} at {temp:.1f}°C")
+
+        if not anomalies:
+            lines.append(f"  {b('🟢 ALL CLEAR — No anomalies detected', C.GRN)}")
+        else:
+            lines.append(f"  {b(f'🔴 {len(anomalies)} ANOMALIES DETECTED', C.RED)}")
+            lines.append("")
+            lines.append(f"  {b('ACTIVE ANOMALIES', C.WHT)}")
+            for a in anomalies:
+                lines.append(a)
+
+        lines.append("")
+        lines.append(f"  {b('SYSTEM HEALTH', C.WHT)}")
+
+        # Color-coded health indicators
+        gpu_str = f"{gpu_t:.1f}°C" if gpu_t is not None else "N/A"
+        gpu_col = alert_color(gpu_t or 0, 55, 70) if gpu_t is not None else C.DIM
+        mem_col = alert_color(mem['available'], 1000, 500, above=False)
+        cpu_col = alert_color(cpu, 60, 85)
+        mem_avail_str = f"{mem['available']/1024:.1f}GB" if mem['available'] >= 1024 else f"{mem['available']}MB"
+
+        lines.append(f"  GPU Temp:   {b(gpu_str, gpu_col)}")
+        lines.append(f"  RAM Free:   {b(mem_avail_str, mem_col)}")
+        lines.append(f"  CPU Load:   {b(f'{cpu}%', cpu_col)}")
+        lines.append(f"  Thermal:    {len(zones)} zones monitored")
+
+        # Threat level
+        threat_count = len(anomalies)
+        if threat_count == 0:
+            threat = (b('GREEN — Nominal', C.GRN), "No action required")
+        elif threat_count <= 2:
+            threat = (b('YELLOW — Caution', C.YEL), "Monitor closely, prepare countermeasures")
+        else:
+            threat = (b('RED — Critical', C.RED), "Immediate action required")
+
+        lines.append("")
+        lines.append(f"  {b('THREAT LEVEL', C.WHT)}")
+        lines.append(f"  {threat[0]}")
+        lines.append(f"  Assessment: {threat[1]}")
+
+        lines.append("")
+        lines.append(f"  {b('EXITS:', C.YEL)} bridge")
+
+        return "\n".join(lines)
+
+    rooms["tactical"] = Room("Tactical",
+        "Red emergency lighting. Threat assessment screens cover the walls. Anomaly detectors pulse.",
+        examine_tactical)
 
     # ENGINE ROOM
     def examine_engine():
@@ -536,6 +662,29 @@ class Starship:
         self.rooms = make_rooms()
         self.current = "bridge"
         self.running = True
+        self.watching = False
+
+    def enter_room(self, room_id):
+        """Move to a room and fire entry hooks."""
+        self.current = room_id
+        warnings = []
+
+        # Hook: Engine Room GPU overheat
+        if room_id == "engine-room":
+            gpu_t = get_gpu_temp()
+            if gpu_t is not None and gpu_t > 75:
+                warnings.append(f"  {b('⚠️  WARNING — GPU running hot!', C.RED)} {gpu_t:.1f}°C exceeds 75°C safe threshold")
+                warnings.append(f"  {C.DIM}Consider reducing GPU workload or checking fan operation.{C.RST}")
+
+        # Hook: Life Support thermal alert
+        if room_id == "life-support":
+            for idx, temp in get_thermal_zones():
+                if temp > 80:
+                    ztype = read_file(f"/sys/class/thermal/thermal_zone{idx}/type") or f"zone{idx}"
+                    warnings.append(f"  {b('⚠️  WARNING — Thermal zone overheating!', C.RED)} {ztype} at {temp:.1f}°C exceeds 80°C")
+                    warnings.append(f"  {C.DIM}Life support systems under thermal stress. Check cooling.{C.RST}")
+
+        return warnings
 
     def status(self):
         """Ship-wide status report."""
@@ -567,38 +716,128 @@ class Starship:
         return "\n".join(lines)
 
     def scan(self):
-        """Deep scan all systems."""
+        """Deep scan all systems with diagnostic report."""
         mem = get_memory()
         zones = get_thermal_zones()
         ifaces = get_interfaces()
         load1, _, _ = get_load()
+        gpu_t = get_gpu_temp()
+        cpu = get_cpu_pct()
 
         lines = [
             "",
-            f"  {b('═══ DEEP SCAN — ALL SYSTEMS ═══', C.YEL)}",
+            f"  {b('═══ DIAGNOSTIC SCAN — ALL SYSTEMS ═══', C.YEL)}",
             "",
-            f"  {b('CPU', C.WHT)}       Load: {load1}",
-            f"  {b('MEMORY', C.WHT)}    {mem['available']}/{mem['total']} MB ({100*mem['available']/mem['total']:.0f}% free)",
-            f"  {b('THERMAL', C.WHT)}   ",
         ]
+
+        # CPU
+        cpu_col = alert_color(cpu, 60, 85)
+        lines.append(f"  {b('CPU', C.WHT)}         {b(f'{cpu}%', cpu_col)} (load avg: {load1})")
+
+        # Memory
+        mem_col = alert_color(mem['available'], 1000, 500, above=False)
+        mem_avail_str = f"{mem['available']/1024:.1f}GB" if mem['available'] >= 1024 else f"{mem['available']}MB"
+        mem_pct_free = 100*mem["available"]/mem["total"]
+        lines.append(f"  {b('MEMORY', C.WHT)}      {b(f'{mem_avail_str} free ({mem_pct_free:.0f}%)', mem_col)}")
+
+        # GPU
+        gpu_str = f"{gpu_t:.1f}°C" if gpu_t is not None else "N/A"
+        gpu_col = alert_color(gpu_t or 0, 55, 70) if gpu_t is not None else C.DIM
+        lines.append(f"  {b('GPU', C.WHT)}         {b(gpu_str, gpu_col)}  {get_gpu_freq()} MHz, sm_8.7, 8 SMs")
+
+        # Thermal
+        lines.append(f"  {b('THERMAL', C.WHT)}     {len(zones)} zones active")
         thermal_parts = []
         for idx, temp in zones[:4]:
             color = C.RED if temp > 70 else C.YEL if temp > 55 else C.GRN
             thermal_parts.append(b(f'{temp:.0f}°C', color))
-        lines.append(f"  {{' '.join(thermal_parts)}}")
+        lines.append(f"  {'    '.join(thermal_parts)}")
+
+        # Network
+        up_count = sum(1 for i in ifaces if i["up"])
+        lines.append(f"  {b('NETWORK', C.WHT)}     {up_count}/{len(ifaces)} interfaces up")
+
+        # Services
+        lines.append(f"  {b('PERCEPTION', C.WHT)}   GPU kernel loaded, 4200 cycles/s")
+        lines.append(f"  {b('VAULT', C.WHT)}       Key server ready (localhost:9437)")
+
+        # Anomalies
+        anomalies = []
+        if gpu_t is not None and gpu_t > 70:
+            anomalies.append("ENGINE OVERHEAT")
+        if mem['available'] < 500:
+            anomalies.append("MEMORY CRITICAL")
+        for _, temp in zones:
+            if temp > 80:
+                anomalies.append("THERMAL CRITICAL")
+
         lines.append("")
-        lines.append(f"  {b('NETWORK', C.WHT)}   {sum(1 for i in ifaces if i['up'])}/{len(ifaces)} interfaces up")
-        lines.append(f"  {b('GPU', C.WHT)}       {get_gpu_freq()} MHz, sm_8.7, 8 SMs")
-        lines.append(f"  {b('PERCEPTION', C.WHT)} GPU kernel loaded, 4200 cycles/s")
-        lines.append(f"  {b('VAULT', C.WHT)}     Key server ready (localhost:9437)")
-        lines.append("")
-        lines.append(f"  {b('ALL SYSTEMS NOMINAL', C.GRN)}")
+        if anomalies:
+            lines.append(f"  {b('ANOMALIES DETECTED', C.RED)}")
+            for a in anomalies:
+                lines.append(f"    {b('⚠️ ' + a, C.RED)}")
+        else:
+            lines.append(f"  {b('ALL SYSTEMS NOMINAL', C.GRN)}")
+
         return "\n".join(lines)
+
+    def pulse(self):
+        """Compact one-line status readout."""
+        gpu_t = get_gpu_temp()
+        mem = get_memory()
+        cpu = get_cpu_pct()
+        gpu_str = f"{gpu_t:.0f}°C" if gpu_t is not None else "??"
+        mem_str = f"{mem['available']/1024:.1f}GB" if mem['available'] >= 1024 else f"{mem['available']}MB"
+        # Simulated nav data placeholders (no real sensors yet)
+        hdg = "247"
+        spd = "5.2"
+        dep = "42.1"
+        return f"  HDG:{hdg}° SPD:{spd}kts DEP:{dep}m GPU:{gpu_str} RAM:{mem_str} CPU:{cpu}%"
+
+    def fleet(self):
+        """Query fleet sensor data from wheelhouse-api."""
+        try:
+            req = urllib.request.Request("http://localhost:9440/gauges")
+            resp = urllib.request.urlopen(req, timeout=3)
+            data = json.loads(resp.read())
+
+            lines = [
+                "",
+                f"  {b('═══ FLEET SENSOR DATA ═══', C.CYN)}",
+                "",
+            ]
+
+            # Pretty-print the JSON data
+            if isinstance(data, dict):
+                for key, val in data.items():
+                    if isinstance(val, dict):
+                        lines.append(f"  {b(key.upper(), C.WHT)}")
+                        for k2, v2 in val.items():
+                            lines.append(f"    {k2}: {v2}")
+                    else:
+                        lines.append(f"  {key}: {val}")
+            else:
+                lines.append(f"  {json.dumps(data, indent=2)}")
+
+            return "\n".join(lines)
+
+        except (urllib.error.URLError, urllib.error.HTTPError, ConnectionRefusedError, TimeoutError, json.JSONDecodeError):
+            return f"\n  {b('Fleet link offline', C.YEL)} — wheelhouse-api not responding at localhost:9440\n  {C.DIM}Ensure wheelhouse-api is running: python3 -m wheelhouse_api{C.RST}"
+        except Exception as e:
+            return f"\n  {b('Fleet link offline', C.YEL)} — {e}"
+
+    def compass_cmd(self):
+        return f"\n  {b('No compass hardware detected.', C.YEL)}\n  Connect HMC5883L to I2C bus 1.\n  {C.DIM}Expected device: /dev/i2c-1 at address 0x1E{C.RST}"
+
+    def gps_cmd(self):
+        return f"\n  {b('No GPS hardware detected.', C.YEL)}\n  Connect NMEA receiver to /dev/ttyTHS1\n  {C.DIM}Expected protocol: NMEA 0183 at 4800 baud{C.RST}"
+
+    def depth_cmd(self):
+        return f"\n  {b('No depth sounder detected.', C.YEL)}\n  Connect to serial.\n  {C.DIM}Expected protocol: NMEA DBT (Depth Below Transducer){C.RST}"
 
     def imagine(self, prompt):
         """Use Seed-2.0-Mini via the holodeck."""
         try:
-            import urllib.request
             data = json.dumps({
                 "name": "creative_ideation",
                 "arguments": {"prompt": prompt, "count": 3, "style": "technical"}
@@ -651,6 +890,10 @@ def main():
             prompt_str = f"[{ship.rooms[ship.current].name}]"
             cmd = input(f"\n  {b(prompt_str, C.CYN)}> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
+            if ship.watching:
+                ship.watching = False
+                print(f"\n  {b('Watch stopped.', C.YEL)}")
+                continue
             print(f"\n  {b('Disconnecting from bridge...', C.YEL)}\n")
             break
 
@@ -671,12 +914,47 @@ def main():
         elif cmd == "scan":
             print(ship.scan())
 
+        elif cmd == "pulse":
+            print(ship.pulse())
+
+        elif cmd == "watch":
+            ship.watching = True
+            print(f"\n  {b('WATCH MODE ACTIVE', C.YEL)} — refreshing every 2s (Ctrl+C to stop)\n")
+            try:
+                while ship.watching:
+                    # Clear and redraw
+                    os.system("clear")
+                    print(ship.rooms[ship.current].examine_fn())
+                    # Status bar at bottom
+                    bar = format_status_bar()
+                    print(f"\n  {b('─── LIVE ───', C.DIM)} {bar} {b('─── LIVE ───', C.DIM)}")
+                    time.sleep(2)
+            except KeyboardInterrupt:
+                ship.watching = False
+                print(f"\n  {b('Watch stopped.', C.YEL)}")
+
+        elif cmd == "fleet":
+            print(ship.fleet())
+
+        elif cmd == "compass":
+            print(ship.compass_cmd())
+
+        elif cmd == "gps":
+            print(ship.gps_cmd())
+
+        elif cmd == "depth":
+            print(ship.depth_cmd())
+
         elif cmd.startswith("go "):
             dest = cmd[3:].strip().replace(" ", "-")
             if dest in ship.rooms:
-                ship.current = dest
+                warnings = ship.enter_room(dest)
                 print(f"\n  {C.DIM}You walk to the {ship.rooms[dest].name}...{C.RST}")
                 print(ship.rooms[dest].examine_fn())
+                if warnings:
+                    print()
+                    for w in warnings:
+                        print(w)
             else:
                 print(f"\n  {b('Unknown location.', C.RED)} Available: {', '.join(ship.rooms.keys())}")
 
@@ -694,12 +972,18 @@ def main():
   {b('examine <thing>', C.CYN)}      Look at something closely
   {b('status', C.CYN)}               Ship-wide status report
   {b('scan', C.CYN)}                 Deep scan all systems
+  {b('watch', C.CYN)}                Auto-refresh telemetry (2s interval)
+  {b('pulse', C.CYN)}                Compact one-line status readout
+  {b('fleet', C.CYN)}                Query fleet sensor data
+  {b('compass', C.CYN)}              Check compass hardware
+  {b('gps', C.CYN)}                  Check GPS hardware
+  {b('depth', C.CYN)}                Check depth sounder
   {b('imagine <prompt>', C.MAG)}     Use holodeck (Seed-2.0-Mini)
   {b('help', C.CYN)}                 Show this help
   {b('quit', C.CYN)}                 Disconnect from bridge
 
   {b('ROOMS', C.WHT)}
-  bridge, engine-room, life-support, cargo-bay,
+  bridge, tactical, engine-room, life-support, cargo-bay,
   sickbay, holodeck, science-lab, airlock, quarterdeck
 """)
 
